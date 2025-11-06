@@ -15,6 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 画像名（owner/repo を小文字化）を作成
       - name: Compute lowercase image name
         run: |
           OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
@@ -45,16 +46,30 @@ jobs:
     runs-on: ubuntu-latest
     needs: build_and_push
     steps:
-      # ← ジョブは常に作る。**ステップの if** で secrets をチェック（ここなら OK）
+      # 注意：環境変数はジョブをまたがらないので、deploy 側でも再計算
+      - name: Compute image name (for deploy job)
+        run: |
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO_LC="$(basename "${GITHUB_REPOSITORY,,}")"
+          echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/${REPO_LC}" >> "$GITHUB_ENV"
+          echo "TAG=latest" >> "$GITHUB_ENV"
+
+      # Secrets が揃っている時だけデプロイ（EC2 に SSH）
       - name: Deploy on EC2 via SSH (only if secrets exist)
         if: ${{ secrets.EC2_HOST != '' && secrets.EC2_USER != '' && secrets.EC2_SSH_KEY != '' }}
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Private パッケージを pull する場合用（Public なら不要）
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          GH_OWNER: ${{ github.repository_owner }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -euo pipefail
+
+            # Docker 未インストールなら導入
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
               sudo apt-get install -y ca-certificates curl
@@ -64,6 +79,13 @@ jobs:
               sudo apt-get update -y
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io
             fi
+
+            # GHCR が Private のときは PAT でログイン（Public の場合はスキップされる）
+            if [ -n "${GHCR_PAT:-}" ]; then
+              echo "$GHCR_PAT" | docker login ghcr.io -u "${GH_OWNER}" --password-stdin
+            fi
+
+            # 旧コンテナ停止＆削除 → 最新イメージ取得 → 起動
             docker ps -aq -f name=nextapp | xargs -r docker rm -f
-            docker pull "${{ env.IMAGE_NAME }}:latest"
-            docker run -d --restart unless-stopped --name nextapp -p 3000:3000 "${{ env.IMAGE_NAME }}:latest"
+            docker pull "${IMAGE_NAME}:${TAG:-latest}"
+            docker run -d --restart unless-stopped --name nextapp -p 3000:3000 "${IMAGE_NAME}:${TAG:-latest}"
