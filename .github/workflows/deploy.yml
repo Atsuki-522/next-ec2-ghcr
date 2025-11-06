@@ -1,0 +1,75 @@
+name: Build (GHCR) and Deploy (EC2)
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  packages: write   # GHCRにpushする権限
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}   # ghcr.io/<owner>/<repo>
+  TAG: latest
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # 標準トークンでOK
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  # ← EC2用。Secretsが未設定なら自動的にスキップされます
+  deploy:
+    if: ${{ secrets.EC2_HOST && secrets.EC2_USER && secrets.EC2_SSH_KEY }}
+    runs-on: ubuntu-latest
+    needs: build_and_push
+    steps:
+      - name: Deploy on EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            # ------- Dockerが無ければ入れる -------
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y ca-certificates curl
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update -y
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+              sudo usermod -aG docker $USER || true
+            fi
+
+            # ------- 旧コンテナ停止＆削除 -------
+            if [ "$(docker ps -aq -f name=nextapp)" ]; then
+              docker stop nextapp || true
+              docker rm nextapp || true
+            fi
+
+            # ------- 最新イメージPull & 起動 -------
+            docker pull ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+            docker run -d --restart unless-stopped --name nextapp -p 3000:3000 ${{ env.IMAGE_NAME }}:${{ env.TAG }}
