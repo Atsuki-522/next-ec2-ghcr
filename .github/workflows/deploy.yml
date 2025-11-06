@@ -15,6 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # owner/repo を小文字化して GHCR イメージ名を生成
       - name: Compute lowercase image name
         run: |
           OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
@@ -42,43 +43,13 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
   deploy:
+    # Secrets が無い環境では配備をスキップ（学内等でも安全）
+    if: ${{ secrets.EC2_HOST && secrets.EC2_USER && secrets.EC2_SSH_KEY }}
     runs-on: ubuntu-latest
     needs: build_and_push
     steps:
-      # deploy ジョブ側でも IMAGE_NAME/TAG を再計算（ジョブ間では env を引き継がない）
-      - name: Compute image name (deploy job)
-        run: |
-          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
-          REPO_LC="$(basename "${GITHUB_REPOSITORY,,}")"
-          echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/${REPO_LC}" >> "$GITHUB_ENV"
-          echo "TAG=latest" >> "$GITHUB_ENV"
-
-      # ← ここで secrets の有無をチェックして「出力」にする（if で secrets を直接参照しない）
-      - id: check
-        name: Check required secrets
-        run: |
-          ok=true
-          [ -z "${{ secrets.EC2_HOST }}" ] && ok=false
-          [ -z "${{ secrets.EC2_USER }}" ] && ok=false
-          [ -z "${{ secrets.EC2_SSH_KEY }}" ] && ok=false
-          echo "ok=$ok" >> "$GITHUB_OUTPUT"
-
-      # GHCR が Private の場合のみ使用（Public なら未設定でOK）
-      - id: have_pat
-        name: Check GHCR_PAT (optional)
-        run: |
-          if [ -n "${{ secrets.GHCR_PAT }}" ]; then
-            echo "have=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Deploy on EC2 via SSH
-        if: steps.check.outputs.ok == 'true'
         uses: appleboy/ssh-action@v1.0.3
-        env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
-          GH_OWNER: ${{ github.repository_owner }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
@@ -86,23 +57,30 @@ jobs:
           script: |
             set -euo pipefail
 
-            # Docker install (if missing)
+            # --- Docker が無ければ入れる ---
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
               sudo apt-get install -y ca-certificates curl
               sudo install -m 0755 -d /etc/apt/keyrings
               curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+                | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
               sudo apt-get update -y
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io
             fi
 
-            # Private GHCR の場合のみログイン
-            if [ "${{ steps.have_pat.outputs.have }}" = "true" ]; then
-              echo "$GHCR_PAT" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
+            # --- Docker デーモン起動 & 自動起動 ---
+            sudo systemctl enable --now docker
+
+            # --- ubuntu を docker グループへ（既に入っていれば何もしない）---
+            if ! id -nG "$USER" | grep -q '\bdocker\b'; then
+              sudo usermod -aG docker "$USER" || true
+              # 非対話セッションでは newgrp が効かないので、この実行では sudo を付け続ける
             fi
 
-            # Restart container with latest image
-            docker ps -aq -f name=nextapp | xargs -r docker rm -f
-            docker pull "${IMAGE_NAME}:${TAG:-latest}"
-            docker run -d --restart unless-stopped --name nextapp -p 3000:3000 "${IMAGE_NAME}:${TAG:-latest}"
+            # --- 旧コンテナ停止/削除 ---
+            sudo docker ps -aq -f name=nextapp | xargs -r sudo docker rm -f
+
+            # --- 最新イメージ Pull & 起動 ---
+            sudo docker pull "${{ env.IMAGE_NAME }}:${{ env.TAG || 'latest' }}"
+            sudo docker run -d --restart unless-stopped --name nextapp -p 3000:3000 "${{ env.IMAGE_NAME }}:${{ env.TAG || 'latest' }}"
