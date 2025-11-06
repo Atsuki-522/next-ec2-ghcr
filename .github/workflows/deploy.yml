@@ -15,7 +15,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # owner/repo を小文字化して GHCR イメージ名を生成
       - name: Compute lowercase image name
         run: |
           OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
@@ -43,8 +42,7 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
   deploy:
-    # Secrets が無い環境では配備をスキップ（学内等でも安全）
-    if: ${{ secrets.EC2_HOST && secrets.EC2_USER && secrets.EC2_SSH_KEY }}
+    if: ${{ (secrets.EC2_HOST != '') && (secrets.EC2_USER != '') && (secrets.EC2_SSH_KEY != '') }}
     runs-on: ubuntu-latest
     needs: build_and_push
     steps:
@@ -57,30 +55,24 @@ jobs:
           script: |
             set -euo pipefail
 
-            # --- Docker が無ければ入れる ---
+            # Install Docker if missing
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
-              sudo apt-get install -y ca-certificates curl
+              sudo apt-get install -y ca-certificates curl gnupg
               sudo install -m 0755 -d /etc/apt/keyrings
               curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
-                | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
               sudo apt-get update -y
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+              sudo systemctl enable --now docker
             fi
 
-            # --- Docker デーモン起動 & 自動起動 ---
-            sudo systemctl enable --now docker
-
-            # --- ubuntu を docker グループへ（既に入っていれば何もしない）---
+            # (optional) add current user to docker group (next login takes effect)
             if ! id -nG "$USER" | grep -q '\bdocker\b'; then
               sudo usermod -aG docker "$USER" || true
-              # 非対話セッションでは newgrp が効かないので、この実行では sudo を付け続ける
             fi
 
-            # --- 旧コンテナ停止/削除 ---
+            # Restart app container with latest image
             sudo docker ps -aq -f name=nextapp | xargs -r sudo docker rm -f
-
-            # --- 最新イメージ Pull & 起動 ---
-            sudo docker pull "${{ env.IMAGE_NAME }}:${{ env.TAG || 'latest' }}"
-            sudo docker run -d --restart unless-stopped --name nextapp -p 3000:3000 "${{ env.IMAGE_NAME }}:${{ env.TAG || 'latest' }}"
+            sudo docker pull "${{ env.IMAGE_NAME }}:${{ env.TAG }}"
+            sudo docker run -d --restart unless-stopped --name nextapp -p 3000:3000 "${{ env.IMAGE_NAME }}:${{ env.TAG }}"
