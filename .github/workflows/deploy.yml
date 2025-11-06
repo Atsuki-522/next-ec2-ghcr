@@ -15,13 +15,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ここで owner/repo を小文字化して環境変数にセット
+      # owner/repo を確実に小文字化して IMAGE_NAME に格納
       - name: Compute lowercase image name
         run: |
-          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
-          REPO_LC="$(basename "${GITHUB_REPOSITORY,,}")"
-          echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/${REPO_LC}" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
           echo "TAG=latest" >> "$GITHUB_ENV"
+          echo "Using image: $(cat $GITHUB_ENV | grep IMAGE_NAME | cut -d= -f2):latest"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -42,6 +41,7 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ env.TAG }}
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
+  # EC2 は Secrets が揃った時だけ実行
   deploy:
     if: ${{ secrets.EC2_HOST && secrets.EC2_USER && secrets.EC2_SSH_KEY }}
     runs-on: ubuntu-latest
@@ -65,9 +65,4 @@ jobs:
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io
               sudo usermod -aG docker $USER || true
             fi
-            if [ "$(docker ps -aq -f name=nextapp)" ]; then
-              docker stop nextapp || true
-              docker rm nextapp || true
-            fi
-            docker pull ${{ env.IMAGE_NAME }}:latest
-            docker run -d --restart unless-stopped --name nextapp -p 3000:3000 ${{ env.IMAGE_NAME }}:latest
+            if [ "$(docker ps -aq -f name=ne]()
