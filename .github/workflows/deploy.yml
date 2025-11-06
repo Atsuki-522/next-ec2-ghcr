@@ -1,8 +1,9 @@
-name: Build (GHCR) and Deploy (EC2)
+name: build-and-deploy
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -12,19 +13,18 @@ jobs:
   build_and_push:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Compute lowercase image name
+      - name: Compute image name (lowercase)
+        shell: bash
         run: |
-          echo "IMAGE_NAME=ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+          IMAGE_NAME="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
           echo "TAG=latest" >> "$GITHUB_ENV"
-          echo "Using image: $(grep IMAGE_NAME $GITHUB_ENV | cut -d= -f2):latest"
+          echo "Using image: $IMAGE_NAME:latest"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      # ← ここを PAT でのログインに変更
       - name: Login to GHCR (PAT)
         uses: docker/login-action@v3
         with:
@@ -32,7 +32,7 @@ jobs:
           username: ${{ secrets.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -42,18 +42,19 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
   deploy:
-    if: ${{ secrets.EC2_HOST && secrets.EC2_USER && secrets.EC2_SSH_KEY }}
-    runs-on: ubuntu-latest
     needs: build_and_push
+    runs-on: ubuntu-latest
+    # EC2 秘密情報が揃ってないときは自動でスキップ
+    if: ${{ secrets.EC2_HOST && secrets.EC2_USER && secrets.EC2_SSH_KEY }}
     steps:
-      - name: Deploy on EC2 via SSH
+      - name: SSH & deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            set -e
+            set -euo pipefail
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
               sudo apt-get install -y ca-certificates curl
@@ -62,11 +63,7 @@ jobs:
               echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
               sudo apt-get update -y
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-              sudo usermod -aG docker $USER || true
             fi
-            if [ "$(docker ps -aq -f name=nextapp)" ]; then
-              docker stop nextapp || true
-              docker rm nextapp || true
-            fi
-            docker pull ${{ env.IMAGE_NAME }}:latest
-            docker run -d --restart unless-stopped --name nextapp -p 3000:3000 ${{ env.IMAGE_NAME }}:latest
+            docker ps -aq -f name=nextapp | xargs -r docker rm -f
+            docker pull "${{ env.IMAGE_NAME }}:latest"
+            docker run -d --restart unless-stopped --name nextapp -p 3000:3000 "${{ env.IMAGE_NAME }}:latest"
