@@ -15,12 +15,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 小文字の ghcr イメージ名を作る
       - name: Compute lowercase image name
+        id: compute
         run: |
           OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
           REPO_LC="$(basename "${GITHUB_REPOSITORY,,}")"
-          echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/${REPO_LC}" >> "$GITHUB_ENV"
-          echo "TAG=latest" >> "$GITHUB_ENV"
+          echo "image_name=ghcr.io/${OWNER_LC}/${REPO_LC}" >> "$GITHUB_OUTPUT"
+          echo "tag=latest" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -38,51 +40,43 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.TAG }}
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ steps.compute.outputs.image_name }}:${{ steps.compute.outputs.tag }}
+            ${{ steps.compute.outputs.image_name }}:${{ github.sha }}
 
   deploy:
-    runs-on: ubuntu-latest
     needs: build_and_push
+    runs-on: ubuntu-latest
     steps:
-      # deploy ジョブ側でも IMAGE_NAME/TAG を再計算（ジョブ間では env を引き継がない）
+      # deploy ジョブ側でも同じ計算をして出力化
       - name: Compute image name (deploy job)
+        id: compute
         run: |
           OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
           REPO_LC="$(basename "${GITHUB_REPOSITORY,,}")"
-          echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/${REPO_LC}" >> "$GITHUB_ENV"
-          echo "TAG=latest" >> "$GITHUB_ENV"
+          echo "image_name=ghcr.io/${OWNER_LC}/${REPO_LC}" >> "$GITHUB_OUTPUT"
+          echo "tag=latest" >> "$GITHUB_OUTPUT"
 
-      # ← ここで secrets の有無をチェックして「出力」にする（if で secrets を直接参照しない）
-      - id: check
-        name: Check required secrets
+      - name: Check required secrets
         run: |
-          ok=true
-          [ -z "${{ secrets.EC2_HOST }}" ] && ok=false
-          [ -z "${{ secrets.EC2_USER }}" ] && ok=false
-          [ -z "${{ secrets.EC2_SSH_KEY }}" ] && ok=false
-          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          set -e
+          : "${{ secrets.EC2_HOST }}" > /dev/null
+          : "${{ secrets.EC2_USER }}" > /dev/null
+          : "${{ secrets.EC2_SSH_KEY }}" > /dev/null
 
-      # GHCR が Private の場合のみ使用（Public なら未設定でOK）
-      - id: have_pat
-        name: Check GHCR_PAT (optional)
-        run: |
-          if [ -n "${{ secrets.GHCR_PAT }}" ]; then
-            echo "have=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Deploy on EC2 via SSH
-        if: steps.check.outputs.ok == 'true'
-        uses: appleboy/ssh-action@v1.0.3
+      # （任意）GHCR が private の場合だけ PAT を使う設計なら残す
+      - name: Check GHCR_PAT (optional)
+        run: echo "GHCR_PAT is ${GHCR_PAT:+set}${GHCR_PAT:+' (hidden)'}"
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
-          GH_OWNER: ${{ github.repository_owner }}
+
+      - name: Deploy on EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          # ★ これが重要：このカンマ区切りの名前の env を EC2 に転送
+          envs: IMAGE_NAME,TAG,GHCR_PAT,GH_OWNER
           script: |
             set -euo pipefail
 
@@ -92,17 +86,24 @@ jobs:
               sudo apt-get install -y ca-certificates curl
               sudo install -m 0755 -d /etc/apt/keyrings
               curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+                | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
               sudo apt-get update -y
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io
             fi
 
-            # Private GHCR の場合のみログイン
-            if [ "${{ steps.have_pat.outputs.have }}" = "true" ]; then
-              echo "$GHCR_PAT" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
+            # Private GHCR の場合のみログイン（GHCR_PAT をセットして使うとき）
+            if [ -n "${GHCR_PAT:-}" ]; then
+              echo "$GHCR_PAT" | sudo docker login ghcr.io -u "$GH_OWNER" --password-stdin
             fi
 
             # Restart container with latest image
-            sudo docker ps -aq -f name=nextapp | xargs -r docker rm -f
+            sudo docker ps -aq -f name=nextapp | xargs -r sudo docker rm -f
             sudo docker pull "${IMAGE_NAME}:${TAG:-latest}"
             sudo docker run -d --restart unless-stopped --name nextapp -p 3000:3000 "${IMAGE_NAME}:${TAG:-latest}"
+        env:
+          # ここで step 出力を env として宣言 → with.envs で EC2 に転送
+          IMAGE_NAME: ${{ steps.compute.outputs.image_name }}
+          TAG: ${{ steps.compute.outputs.tag }}
+          GH_OWNER: ${{ github.repository_owner }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
