@@ -107,3 +107,18 @@ jobs:
           TAG: ${{ steps.compute.outputs.tag }}
           GH_OWNER: ${{ github.repository_owner }}
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        
+
+      - name: Notify Lambda about deployment result
+        if: always()
+        env:
+          LAMBDA_URL: ${{ secrets.LAMBDA_URL }}
+          STATUS: ${{ job.status }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          TIMESTAMP: ${{ github.run_started_at }}
+        run: |
+          echo "Notifying Lambda..."
+          curl -X POST "$LAMBDA_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\":\"$STATUS\",\"branch\":\"$BRANCH\",\"commit\":\"$COMMIT\",\"timestamp\":\"$TIMESTAMP\"}"
